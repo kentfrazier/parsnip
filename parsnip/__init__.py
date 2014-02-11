@@ -1,11 +1,6 @@
 import __future__
 import ast
-from collections import (
-    defaultdict,
-    Sequence,
-)
-from functools import partial
-import json
+from collections import defaultdict
 try:
     from cStringIO import StringIO
     StringIO  # calm down, pyflakes
@@ -13,131 +8,6 @@ except ImportError:
     from StringIO import StringIO
 import symtable
 import tokenize
-from xml.etree.ElementTree import TreeBuilder
-
-
-class Walker(ast.NodeVisitor):
-    def __init__(self, node):
-        if isinstance(node, Sequence) and not isinstance(node, basestring):
-            self.root = []
-            self.handlers = [self.root.append]
-            for n in node:
-                self.visit(n)
-        else:
-            self.root = None
-            self.handlers = [partial(setattr, self, 'root')]
-            self.visit(node)
-
-    def _process(self, value, handler):
-        stack = self.handlers
-        if isinstance(value, list):
-            seq = []
-            handler(seq)
-            for item in value:
-                self._process(item, seq.append)
-        else:
-            assert isinstance(value, ast.AST), "Unexpected type: {0}".format(type(value))
-            stack.append(handler)
-            self.visit(value)
-            stack.pop()
-
-    def generic_visit(self, node):
-        current = {
-            '__ast__': node,
-            '__type__': type(node).__name__,
-        }
-
-        lineno = getattr(node, 'lineno', None)
-        if lineno is not None:
-            current['lineno'] = lineno
-        col_offset = getattr(node, 'col_offset', None)
-        if col_offset is not None:
-            current['col_offset'] = col_offset
-
-        # TODO: maybe try to see if this could be detected as duplicate code
-        # and refactored into a for loop using the tool.
-        # Finished product should be something like:
-        #     for gensym0 in ('lineno', 'col_offset'):
-        #         gensym1 = getattr(node, gensym0, None)
-        #         if gensym1 is not None:
-        #             current[gensym0] = gensym1
-
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)):
-            current['docstring'] = ast.get_docstring(node)
-
-        for field, value in ast.iter_fields(node):
-            if value is None or isinstance(value, (str, unicode, int, float)):
-                current[field] = value
-            else:
-                assert isinstance(value, (ast.AST, list)), "Unexpected type for field '{0}': {1}".format(field, type(value))
-                self._process(value, partial(current.__setitem__, field))
-
-        self.handlers[-1](current)
-
-    @classmethod
-    def from_source_string(self, src, filename='<string>'):
-        return Walker(ast.parse(src))
-
-    @classmethod
-    def from_source_path(self, path):
-        with open(path) as f:
-            return Walker.from_source_string(f.read(), path)
-
-    def to_json(self):
-        def clean(item):
-            if isinstance(item, list):
-                return [clean(el) for el in item]
-            elif isinstance(item, dict):
-                return dict(
-                    (k, clean(v)) for k, v in item.iteritems() if k != '__ast__'
-                )
-            else:
-                return item
-
-        return json.dumps(clean(self.root))
-
-    def to_xml(self):
-        builder = TreeBuilder()
-
-        def process_node(node):
-            node_type = None
-            simple_attrs = {}
-            complex_attrs = {}
-
-            for key, value in node.iteritems():
-                if key == '__ast__':
-                    continue
-                elif key == '__type__':
-                    node_type = value
-                elif key == '__docstring__':
-                    simple_attrs['docstring'] = repr(value)
-                elif value is None or isinstance(value, (dict, list)):
-                    complex_attrs[key] = value
-                else:
-                    simple_attrs[key] = repr(value)
-
-            builder.start(node_type, simple_attrs)
-            for subkey, subvalue in complex_attrs.iteritems():
-                builder.start(subkey, {})
-                if isinstance(subvalue, list):
-                    for item in subvalue:
-                        process_node(item)
-                elif isinstance(subvalue, dict):
-                    process_node(subvalue)
-                else:
-                    pass  # None, so should be an empty element
-                builder.end(subkey)
-            builder.end(node_type)
-
-        if isinstance(self.root, list):
-            builder.start('nodelist', {})
-            for n in self.root:
-                process_node(n)
-            builder.end('nodelist')
-        else:
-            process_node(self.root)
-
-        return builder.close()
 
 
 class Module(object):
@@ -148,11 +18,18 @@ class Module(object):
         self.ast = ast.parse(source, path)
         self.symtable = symtable.symtable(source, path, 'exec')
         self.tokens = tokenize_string(source)
+        cw = ChainWalker(self.ast)
+        self.nodes = cw.nodes
+        TokenAssociator(self.nodes, self.tokens)
 
     @classmethod
-    def from_path(self, path):
+    def parse_path(cls, path):
         with open(path) as f:
-            return Module(f.read(), path)
+            return cls.parse(f.read(), path)
+
+    @classmethod
+    def parse(cls, source, path='<string>'):
+        return cls(source, path)
 
 
 class Node(object):
@@ -312,42 +189,28 @@ class TokenAssociator(object):
         for i, node in enumerate(self.ordered_nodes):
             success = False
             while node.token_end < num_tokens:
-                #if i == 1682:
-                #    import ipdb; ipdb.set_trace()
                 if self.token_match(node):
                     success = True
                     break
                 else:
                     node.associate_token(node.token_end)
-            if success:
-                print i, 'SUCCESS!'
-                #print '  ', node
-                #print '  ', tokenize.untokenize(map(_decontextify_token, tokens[node.token_start:node.token_end]))
-            else:
+            if not success:
                 print i, 'FAILURE!'
                 print '  ', node
                 print ast.dump(node.ast_node)
                 print '  ', tokenize.untokenize(map(_decontextify_token, self.tokens[node.token_start:node.token_end]))
 
-    def fix_brackets(self, tokens):
-        """
-        Fix bracket mismatches in token stream.
-        """
-        bracket_stack = []
-        to_add = []
-        for token in tokens:
-            if token[0] == tokenize.OP:
-                op = token[1]
-                if op in OPEN_BRACKETS:
-                    bracket_stack.append(op)
-                elif op in CLOSE_BRACKETS:
-                    opener = BRACKET_MAP[op]
-                    if bracket_stack and bracket_stack[-1] == opener:
-                        bracket_stack.pop()
-                    else:
-                        to_add.append((tokenize.OP, opener))
-        to_add.reverse()
-        return to_add + tokens
+    def find_adjacent_token(self, start, step, target_token):
+        offset = start + step
+        token = self.decontextified_tokens[offset]
+        while token in {tokenize.NL, tokenize.COMMENT}:
+            offset += step
+            token = self.decontextified_tokens[offset]
+
+        if token == target_token:
+            return offset
+
+        return None
 
     def match_AST(self, node, tokens):
         source = tokenize.untokenize(tokens)
@@ -389,12 +252,8 @@ class TokenAssociator(object):
         return self.match_AST(node, tokens)
 
     def match_ListComp(self, node, tokens):
-        prev_offset = node.token_start - 1
-        while self.decontextified_tokens[prev_offset][0] in {tokenize.NL,
-                                                             tokenize.COMMENT}:
-            prev_offset -= 1
-        prev_token = self.decontextified_tokens[prev_offset]
-        assert prev_token == LSQUARE, 'unexpected token: {0}'.format(prev_token)
+        prev_offset = self.find_adjacent_token(node.token_start, -1, LSQUARE)
+        assert prev_offset is not None, "Couldn't find ["
         node.associate_token(prev_offset)
 
         end = node.token_end
@@ -406,9 +265,20 @@ class TokenAssociator(object):
             new_ast = self.match_AST(node, tokens)
         return new_ast
 
+    def match_Tuple(self, node, tokens):
+        prev_offset = self.find_adjacent_token(node.token_start, -1, LPAREN)
+        if prev_offset is not None:
+            node.associate_token(prev_offset)
+            next_offset = self.find_adjacent_token(node.token_end - 1, 1, RPAREN)
+            assert next_offset is not None, "Couldn't find )"
+            node.associate_token(next_offset)
+            tokens = self.decontextified_tokens[node.token_start:node.token_end]
+        return self.match_AST(node, tokens)
+
     def match_expr(self, node, tokens):
         return self.match_AST(node,
-                              [LPAREN] + self.fix_brackets(tokens) + [RPAREN])
+                              #[LPAREN] + self.fix_brackets(tokens) + [RPAREN])
+                              [LPAREN] + tokens + [RPAREN])
 
     def token_match(self, node):
         tokens = self.decontextified_tokens[node.token_start:node.token_end]
