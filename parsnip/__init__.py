@@ -18,7 +18,7 @@ class Module(object):
         self.ast = ast.parse(source, path)
         self.symtable = symtable.symtable(source, path, 'exec')
         self.tokens = tokenize_string(source)
-        cw = ChainWalker(self.ast)
+        cw = ChainWalker(self.ast, self.symtable)
         self.nodes = cw.nodes
         TokenAssociator(self.nodes, self.tokens)
 
@@ -34,11 +34,15 @@ class Module(object):
 
 class Node(object):
 
-    def __init__(self, level, ast_node, parent, compiler_flags=0):
+    def __init__(self, level, ast_node, namespaces, is_namespace, parent,
+                 compiler_flags):
         self.compiler_flags = compiler_flags
         self.level = level
         self.line = getattr(ast_node, 'lineno', None)
         self.col = getattr(ast_node, 'col_offset', None)
+
+        self.namespaces = namespaces
+        self.is_namespace = is_namespace
 
         self.ast_node = ast_node
         self.parent = parent
@@ -72,12 +76,26 @@ class Node(object):
 
 class ChainWalker(ast.NodeVisitor):
 
-    def __init__(self, ast_node):
+    def __init__(self, module_ast, module_symtable):
         self.compiler_flags = ast.PyCF_ONLY_AST
         self.levels = {}
         self.level = 0
         self.nodes = []
-        self.visit(ast_node)
+
+        assert isinstance(module_ast, ast.Module), \
+                'Only module ASTs should be passed to ChainWalker'
+
+        # Module will be processed first, so this should be fine
+        self.is_namespace = True
+        self.namespaces = [module_symtable]
+
+        self.visit(module_ast)
+
+    def get_namespace(self, ast_node):
+        symbol = self.namespaces[-1].lookup(ast_node.name)
+        assert symbol.is_namespace(), \
+                'Should only be called on namespaced nodes'
+        return symbol.get_namespace()
 
     def visit_ImportFrom(self, ast_node):
         # If there are __future__ imports in effect, they affect parsing,
@@ -88,11 +106,23 @@ class ChainWalker(ast.NodeVisitor):
                 self.compiler_flags |= feature.compiler_flag
         self.generic_visit(ast_node)
 
+    def visit_namespaced_node(self, ast_node):
+        self.namespaces.append(self.get_namespace(ast_node))
+        self.is_namespace = True
+        self.generic_visit(ast_node)
+        self.namespaces.pop()
+
+    visit_ClassDef = visit_namespaced_node
+    visit_FunctionDef = visit_namespaced_node
+
     def generic_visit(self, ast_node):
         node = Node(level=self.level,
                     ast_node=ast_node,
+                    namespaces=tuple(reversed(self.namespaces)),
+                    is_namespace=self.is_namespace,
                     parent=self.levels.get(self.level - 1, None),
                     compiler_flags=self.compiler_flags)
+        self.is_namespace = False  # reset until next namespaced node
         self.levels[self.level] = node
         self.nodes.append(node)
         self.level += 1
@@ -104,16 +134,19 @@ def ast_equal(node1, node2):
     # don't bail if they disagree on string type
     if isinstance(node1, basestring) and isinstance(node2, basestring):
         return node1 == node2
+    # context depends heavily on surrounding code, so we will ignore it for
+    # comparison of these snippets
+    elif isinstance(node1, ast.expr_context) and isinstance(node2, ast.expr_context):
+        return True
     elif type(node1) != type(node2):
         return False
+    elif isinstance(node1, list):
+        return all(ast_equal(val1, val2) for val1, val2 in zip(node1, node2))
     elif isinstance(node1, ast.AST):
         return all(
             ast_equal(value, getattr(node2, field)) for field, value
             in ast.iter_fields(node1)
-            if field != 'ctx'  # context won't be accurate with surrounding code
         )
-    elif isinstance(node1, list):
-        return all(ast_equal(val1, val2) for val1, val2 in zip(node1, node2))
     else:
         return node1 == node2
 
@@ -136,6 +169,8 @@ LPAREN = (tokenize.OP, '(')
 RPAREN = (tokenize.OP, ')')
 LSQUARE = (tokenize.OP, '[')
 RSQUARE = (tokenize.OP, ']')
+LCURL = (tokenize.OP, '{')
+RCURL = (tokenize.OP, '}')
 
 BRACKET_MAP = {
     '}': '{',
@@ -264,6 +299,23 @@ class TokenAssociator(object):
             tokens = self.decontextified_tokens[node.token_start:node.token_end]
             new_ast = self.match_AST(node, tokens)
         return new_ast
+
+    def match_set_or_dict_comp(self, node, tokens):
+        prev_offset = self.find_adjacent_token(node.token_start, -1, LCURL)
+        assert prev_offset is not None, "Couldn't find {"
+        node.associate_token(prev_offset)
+
+        end = node.token_end
+        new_ast = None
+        while new_ast is None and end >= 0:
+            end = self.decontextified_tokens.index(RCURL, end)
+            node.associate_token(end)
+            tokens = self.decontextified_tokens[node.token_start:node.token_end]
+            new_ast = self.match_AST(node, tokens)
+        return new_ast
+
+    match_SetComp = match_set_or_dict_comp
+    match_DictComp = match_set_or_dict_comp
 
     def match_Tuple(self, node, tokens):
         prev_offset = self.find_adjacent_token(node.token_start, -1, LPAREN)
