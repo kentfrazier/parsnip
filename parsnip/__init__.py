@@ -88,6 +88,7 @@ class ChainWalker(ast.NodeVisitor):
         # Module will be processed first, so this should be fine
         self.is_namespace = True
         self.namespaces = [module_symtable]
+        self.lookup_counts_stack = [defaultdict(int)]
 
         self.visit(module_ast)
 
@@ -95,7 +96,12 @@ class ChainWalker(ast.NodeVisitor):
         symbol = self.namespaces[-1].lookup(ast_node.name)
         assert symbol.is_namespace(), \
                 'Should only be called on namespaced nodes'
-        return symbol.get_namespace()
+        lookup_counts = self.lookup_counts_stack[-1]
+        namespace = symbol.get_namespaces()[lookup_counts[ast_node.name]]
+        lookup_counts[ast_node.name] += 1
+        return namespace
+
+
 
     def visit_ImportFrom(self, ast_node):
         # If there are __future__ imports in effect, they affect parsing,
@@ -108,9 +114,11 @@ class ChainWalker(ast.NodeVisitor):
 
     def visit_namespaced_node(self, ast_node):
         self.namespaces.append(self.get_namespace(ast_node))
+        self.lookup_counts_stack.append(defaultdict(int))
         self.is_namespace = True
         self.generic_visit(ast_node)
         self.namespaces.pop()
+        self.lookup_counts_stack.pop()
 
     visit_ClassDef = visit_namespaced_node
     visit_FunctionDef = visit_namespaced_node
@@ -180,6 +188,11 @@ BRACKET_MAP = {
 OPEN_BRACKETS = set(BRACKET_MAP.itervalues())
 CLOSE_BRACKETS = set(BRACKET_MAP)
 
+
+def _ignore_token(token):
+    return token[0] in {tokenize.COMMENT, tokenize.NL}
+
+
 class TokenAssociator(object):
 
     def __init__(self, nodes, tokens):
@@ -235,10 +248,11 @@ class TokenAssociator(object):
                 print ast.dump(node.ast_node)
                 print '  ', tokenize.untokenize(map(_decontextify_token, self.tokens[node.token_start:node.token_end]))
 
-    def find_adjacent_token(self, start, step, target_token):
+    def find_adjacent_token(self, start, step, target_token,
+                            ignore=_ignore_token):
         offset = start + step
         token = self.decontextified_tokens[offset]
-        while token in {tokenize.NL, tokenize.COMMENT}:
+        while ignore(token):
             offset += step
             token = self.decontextified_tokens[offset]
 
@@ -251,7 +265,6 @@ class TokenAssociator(object):
         source = tokenize.untokenize(tokens)
 
         try:
-            # TODO: try 'eval' mode here. It might work better.
             new_ast = compile(
                 source,
                 '<string>',
@@ -286,51 +299,78 @@ class TokenAssociator(object):
                 tokens = [_decontextify_token(prev_token)] + tokens
         return self.match_AST(node, tokens)
 
+    def match_comprehension(self, node, tokens, left, right):
+        prev_offset = self.find_adjacent_token(node.token_start, -1, left)
+        assert prev_offset is not None, "Couldn't find {0}".format(left)
+        node.associate_token(prev_offset)
+
+        next_offset = self.find_adjacent_token(node.token_end - 1, 1, right)
+        assert next_offset is not None, "Couldn't find {0}".format(right)
+        node.associate_token(next_offset)
+        tokens = self.decontextified_tokens[node.token_start:node.token_end]
+
+        return self.match_AST(node, tokens)
+
+    def match_Attribute(self, node, tokens):
+        end_token = (tokenize.NAME, node.ast_node.attr)
+        next_token = self.decontextified_tokens[node.token_end]
+        while next_token != end_token:
+            node.associate_token(node.token_end)
+            if next_token[0] == tokenize.OP and next_token[1] in BRACKET_MAP:
+                opener = BRACKET_MAP[next_token[1]]
+                prev_offset = self.find_adjacent_token(node.token_start, -1,
+                                                       (tokenize.OP, opener))
+                assert prev_offset is not None
+                node.associate_token(prev_offset)
+            next_token = self.decontextified_tokens[node.token_end]
+        node.associate_token(node.token_end)
+        tokens = self.decontextified_tokens[node.token_start:node.token_end]
+        return self.match_expr(node, tokens)
+
+
+    def match_DictComp(self, node, tokens):
+        return self.match_comprehension(node, tokens, LCURL, RCURL)
+
     def match_ListComp(self, node, tokens):
-        prev_offset = self.find_adjacent_token(node.token_start, -1, LSQUARE)
-        assert prev_offset is not None, "Couldn't find ["
-        node.associate_token(prev_offset)
+        return self.match_comprehension(node, tokens, LSQUARE, RSQUARE)
 
-        end = node.token_end
-        new_ast = None
-        while new_ast is None and end >= 0:
-            end = self.decontextified_tokens.index(RSQUARE, end)
-            node.associate_token(end)
-            tokens = self.decontextified_tokens[node.token_start:node.token_end]
-            new_ast = self.match_AST(node, tokens)
-        return new_ast
-
-    def match_set_or_dict_comp(self, node, tokens):
-        prev_offset = self.find_adjacent_token(node.token_start, -1, LCURL)
-        assert prev_offset is not None, "Couldn't find {"
-        node.associate_token(prev_offset)
-
-        end = node.token_end
-        new_ast = None
-        while new_ast is None and end >= 0:
-            end = self.decontextified_tokens.index(RCURL, end)
-            node.associate_token(end)
-            tokens = self.decontextified_tokens[node.token_start:node.token_end]
-            new_ast = self.match_AST(node, tokens)
-        return new_ast
-
-    match_SetComp = match_set_or_dict_comp
-    match_DictComp = match_set_or_dict_comp
+    def match_SetComp(self, node, tokens):
+        return self.match_comprehension(node, tokens, LCURL, RCURL)
 
     def match_Tuple(self, node, tokens):
+
+        def ignore_trailing(token):
+            if token[0] in {tokenize.NL, tokenize.COMMENT}:
+                return True
+            elif token == (tokenize.OP, ','):
+                return True
+            return False
+
         prev_offset = self.find_adjacent_token(node.token_start, -1, LPAREN)
         if prev_offset is not None:
             node.associate_token(prev_offset)
-            next_offset = self.find_adjacent_token(node.token_end - 1, 1, RPAREN)
+            next_offset = self.find_adjacent_token(
+                node.token_end - 1,
+                1,
+                RPAREN,
+                ignore=ignore_trailing,
+            )
             assert next_offset is not None, "Couldn't find )"
             node.associate_token(next_offset)
             tokens = self.decontextified_tokens[node.token_start:node.token_end]
         return self.match_AST(node, tokens)
 
+    def match_With(self, node, tokens):
+        prev_offset = self.find_adjacent_token(node.token_start, -1,
+                                               (tokenize.NAME, 'with'))
+        assert prev_offset is not None, "Couldn't find with keyword"
+        node.associate_token(prev_offset)
+
+        tokens = self.decontextified_tokens[node.token_start:node.token_end]
+        return self.match_AST(node, tokens)
+
     def match_expr(self, node, tokens):
-        return self.match_AST(node,
-                              #[LPAREN] + self.fix_brackets(tokens) + [RPAREN])
-                              [LPAREN] + tokens + [RPAREN])
+        return self.match_AST(node, [LPAREN] + tokens + [RPAREN])
 
     def token_match(self, node):
         tokens = self.decontextified_tokens[node.token_start:node.token_end]
