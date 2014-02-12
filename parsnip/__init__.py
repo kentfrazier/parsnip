@@ -73,6 +73,20 @@ class Node(object):
     def has_pos(self):
         return self.line is not None and self.col is not None
 
+    def is_descendant(self, other_node):
+        while other_node is not None:
+            if other_node.ast_node == self.ast_node:
+                return True
+            other_node = other_node.parent
+        return False
+
+    def ancestor(self, predicate):
+        if predicate(self):
+            return self
+        if self.parent is None:
+            return None
+        return self.parent.ancestor(predicate)
+
 
 class ChainWalker(ast.NodeVisitor):
 
