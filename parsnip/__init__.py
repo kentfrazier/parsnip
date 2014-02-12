@@ -21,6 +21,7 @@ class Module(object):
         cw = ChainWalker(self.ast, self.symtable)
         self.nodes = cw.nodes
         TokenAssociator(self.nodes, self.tokens)
+        self.ast_map = {node.ast_node: node for node in self.nodes}
 
     @classmethod
     def parse_path(cls, path):
@@ -30,6 +31,9 @@ class Module(object):
     @classmethod
     def parse(cls, source, path='<string>'):
         return cls(source, path)
+
+    def tokens_for_node(self, node):
+        return self.tokens[node.token_start : node.token_end]
 
 
 class Node(object):
@@ -221,6 +225,14 @@ class TokenAssociator(object):
 
         self.associate_initial_tokens()
         self.find_token_extents()
+
+        # The module should encompass all tokens, including any leading or
+        # trailing COMMENT and NL tokens that might have been skipped in the
+        # previous processing
+        module_node = self.nodes[0]
+        assert isinstance(module_node.ast_node, ast.Module)
+        module_node.associate_token(0)
+        module_node.associate_token(len(tokens) - 1)
 
     def build_token_map(self, tokens):
         token_map = defaultdict(dict)

@@ -1,131 +1,241 @@
 import ast
-from collections import Sequence
+from collections import namedtuple
 from functools import partial
 import json
-from xml.etree.ElementTree import TreeBuilder
+try:
+    from cStringIO import StringIO
+    StringIO
+except ImportError:
+    from StringIO import StringIO
+from xml.etree.ElementTree import (
+    ElementTree,
+    TreeBuilder,
+)
 
 
-class Walker(ast.NodeVisitor):
-    def __init__(self, node):
-        if isinstance(node, Sequence) and not isinstance(node, basestring):
-            self.root = []
-            self.handlers = [self.root.append]
-            for n in node:
-                self.visit(n)
-        else:
-            self.root = None
-            self.handlers = [partial(setattr, self, 'root')]
-            self.visit(node)
+types = namedtuple('types', 'AST CST TOKENS BYTECODES DEFAULT ALL')(
+    AST=1,
+    CST=2,
+    TOKENS=4,
+    BYTECODES=8,
+    DEFAULT=1 | 2 | 4,  # no BYTECODES by default, since it requires compiling
+    ALL=1 | 2 | 4 | 8,
+)
 
-    def _process(self, value, handler):
-        stack = self.handlers
-        if isinstance(value, list):
-            seq = []
-            handler(seq)
+
+class ModuleSerializer(ast.NodeVisitor):
+
+    @classmethod
+    def serialize(cls, module):
+        serializer = cls(module)
+        serializer.run()
+        return serializer
+
+    def __init__(self, module):
+        self.module = module
+
+    def run(self):
+        self.visit(self.module.ast)
+
+    def get_root(self):
+        raise NotImplementedError()
+
+    def start_ast(self, ast_node):
+        raise NotImplementedError()
+
+    def end_ast(self, ast_node):
+        raise NotImplementedError()
+
+    def start_list_field(self, field, value):
+        raise NotImplementedError()
+
+    def end_list_field(self, field, value):
+        raise NotImplementedError()
+
+    def process_string_field(self, field, value):
+        raise NotImplementedError()
+
+    def process_number_field(self, field, value):
+        raise NotImplementedError()
+
+    def process_null_field(self, field):
+        raise NotImplementedError()
+
+    def process_ast_field(self, field, value):
+        self.visit(value)
+
+    def process_field(self, field, value):
+        if value is None:
+            self.process_null_field(field)
+        elif isinstance(value, list):
+            self.start_list_field(field, value)
             for item in value:
-                self._process(item, seq.append)
+                self.visit(item)
+            self.end_list_field(field, value)
+        elif isinstance(value, basestring):
+            self.process_string_field(field, value)
+        elif isinstance(value, (int, long, float)):
+            self.process_number_field(field, value)
         else:
-            assert isinstance(value, ast.AST), "Unexpected type: {0}".format(type(value))
-            stack.append(handler)
-            self.visit(value)
-            stack.pop()
+            assert isinstance(value, ast.AST)
+            self.process_ast_field(field, value)
 
     def generic_visit(self, node):
-        current = {
-            '__ast__': node,
+        self.start_ast(node)
+        for field, value in ast.iter_fields(node):
+            self.process_field(field, value)
+        self.end_ast(node)
+
+
+class DictModuleSerializer(ModuleSerializer):
+
+    def __init__(self, module):
+        super(DictModuleSerializer, self).__init__(module)
+        self.stack = []
+        self.root = None
+        self.handlers = [self.set_root]
+
+    def set_root(self, root):
+        self.root = root
+
+    def get_root(self):
+        return self.root
+
+    def process_field(self, field, value):
+        self.handlers.append(partial(self.stack[-1].__setitem__, field))
+        super(DictModuleSerializer, self).process_field(field, value)
+        self.handlers.pop()
+
+    def handle(self, value):
+        self.handlers[-1](value)
+
+    def start_ast(self, node):
+        node_dict = {
             '__type__': type(node).__name__,
         }
+        line = getattr(node, 'lineno', None)
+        if line is not None:
+            node_dict['__line__'] = line
+        col = getattr(node, 'col_offset', None)
+        if col is not None:
+            node_dict['__col__'] = col
+        self.handle(node_dict)
+        self.stack.append(node_dict)
 
-        lineno = getattr(node, 'lineno', None)
-        if lineno is not None:
-            current['lineno'] = lineno
-        col_offset = getattr(node, 'col_offset', None)
-        if col_offset is not None:
-            current['col_offset'] = col_offset
+    def end_ast(self, ast_node):
+        self.stack.pop()
 
-        # TODO: maybe try to see if this could be detected as duplicate code
-        # and refactored into a for loop using the tool.
-        # Finished product should be something like:
-        #     for gensym0 in ('lineno', 'col_offset'):
-        #         gensym1 = getattr(node, gensym0, None)
-        #         if gensym1 is not None:
-        #             current[gensym0] = gensym1
+    def start_list_field(self, field, value):
+        items = []
+        self.handle(items)
+        self.handlers.append(items.append)
 
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)):
-            current['docstring'] = ast.get_docstring(node)
+    def end_list_field(self, field, value):
+        self.handlers.pop()
 
-        for field, value in ast.iter_fields(node):
-            if value is None or isinstance(value, (str, unicode, int, float)):
-                current[field] = value
-            else:
-                assert isinstance(value, (ast.AST, list)), "Unexpected type for field '{0}': {1}".format(field, type(value))
-                self._process(value, partial(current.__setitem__, field))
+    def process_string_field(self, field, value):
+        self.handle(value)
 
-        self.handlers[-1](current)
+    def process_number_field(self, field, value):
+        self.handle(value)
 
-    @classmethod
-    def from_source_string(self, src, filename='<string>'):
-        return Walker(ast.parse(src))
+    def process_null_field(self, field):
+        self.handle(None)
 
-    @classmethod
-    def from_source_path(self, path):
-        with open(path) as f:
-            return Walker.from_source_string(f.read(), path)
+    def json(self):
+        return json.dumps(self.root)
 
-    def to_json(self):
-        def clean(item):
-            if isinstance(item, list):
-                return [clean(el) for el in item]
-            elif isinstance(item, dict):
-                return dict(
-                    (k, clean(v)) for k, v in item.iteritems() if k != '__ast__'
-                )
-            else:
-                return item
-
-        return json.dumps(clean(self.root))
-
-    def to_xml(self):
-        builder = TreeBuilder()
-
-        def process_node(node):
-            node_type = None
-            simple_attrs = {}
-            complex_attrs = {}
-
-            for key, value in node.iteritems():
-                if key == '__ast__':
-                    continue
-                elif key == '__type__':
-                    node_type = value
-                elif key == '__docstring__':
-                    simple_attrs['docstring'] = repr(value)
-                elif value is None or isinstance(value, (dict, list)):
-                    complex_attrs[key] = value
-                else:
-                    simple_attrs[key] = repr(value)
-
-            builder.start(node_type, simple_attrs)
-            for subkey, subvalue in complex_attrs.iteritems():
-                builder.start(subkey, {})
-                if isinstance(subvalue, list):
-                    for item in subvalue:
-                        process_node(item)
-                elif isinstance(subvalue, dict):
-                    process_node(subvalue)
-                else:
-                    pass  # None, so should be an empty element
-                builder.end(subkey)
-            builder.end(node_type)
-
-        if isinstance(self.root, list):
-            builder.start('nodelist', {})
-            for n in self.root:
-                process_node(n)
-            builder.end('nodelist')
+    def write_json(self, path):
+        json_s = self.json()
+        if hasattr(path, 'write'):
+            path.write(json_s)
         else:
-            process_node(self.root)
+            with open(path, 'w') as f:
+                f.write(json_s)
 
-        return builder.close()
+
+ElementBuilder = namedtuple('ElementBuilder', 'tag attrs children')
 
 
+class EtreeModuleSerializer(ModuleSerializer):
+
+    def __init__(self, module):
+        super(EtreeModuleSerializer, self).__init__(module)
+        self.stack = [ElementBuilder('root', {}, [])]
+        self.builder = TreeBuilder()
+        self.etree = None
+
+    def get_root(self):
+        if self.etree is None:
+            assert len(self.stack) == 1
+            assert len(self.stack[0].children) == 1
+            self._build(self.stack[0].children[0])
+            self.etree = ElementTree(self.builder.close())
+        return self.etree
+
+    def add_attr(self, attr, value):
+        self.stack[-1].attrs[attr] = value
+
+    def add_child(self, child):
+        self.stack[-1].children.append(child)
+
+    def start_ast(self, node):
+        el = ElementBuilder(type(node).__name__, {}, [])
+        line = getattr(node, 'lineno', None)
+        if line is not None:
+            el.attrs['line'] = repr(line)
+        col = getattr(node, 'col_offset', None)
+        if col is not None:
+            el.attrs['col'] = repr(col)
+        self.add_child(el)
+        self.stack.append(el)
+
+    def end_ast(self, node):
+        self.stack.pop()
+
+    def start_list_field(self, field, value):
+        el = ElementBuilder(field, {}, [])
+        self.add_child(el)
+        self.stack.append(el)
+
+    def end_list_field(self, field, value):
+        self.stack.pop()
+
+    def process_ast_field(self, field, value):
+        el = ElementBuilder(field, {}, [])
+        self.add_child(el)
+        self.stack.append(el)
+        super(EtreeModuleSerializer, self).process_ast_field(field, value)
+        self.stack.pop()
+
+    def process_string_field(self, field, value):
+        self.add_attr(field, value)
+
+    def process_number_field(self, field, value):
+        self.add_attr(field, repr(value))
+
+    def process_null_field(self, field):
+        self.add_child(ElementBuilder(field, {}, []))
+
+    def _build(self, el):
+        self.builder.start(el.tag, el.attrs)
+        for child in el.children:
+            self._build(child)
+        self.builder.end(el.tag)
+
+    def write_xml(self, path):
+        etree = self.get_root()
+        if hasattr(path, 'write'):
+            etree.write(path, 'utf-8')
+        else:
+            with open(path, 'w') as f:
+                etree.write(f, 'utf-8')
+
+    def xml_string(self):
+        f = StringIO()
+        self.write_xml(f)
+        f.seek(0)
+        return f.read()
+
+    def generic_visit(self, node):
+        super(EtreeModuleSerializer, self).generic_visit(node)
