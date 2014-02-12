@@ -12,5 +12,6 @@ setup(
     description='Python parsing and manipulation',
     author='Kent Frazier',
     author_email='kentfrazier@gmail.com',
+    url='https://github.com/kentfrazier/parsnip',
     packages=find_packages(),
 )
