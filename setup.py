@@ -1,5 +1,8 @@
-from ez_setup import use_setuptools
-use_setuptools()
+try:
+    from ez_setup import use_setuptools
+    use_setuptools()
+except ImportError:
+    pass
 
 from setuptools import (
     find_packages,
@@ -8,7 +11,7 @@ from setuptools import (
 
 setup(
     name='parsnip',
-    version='0.1.0',
+    version='0.1.1',
     description='Library for parsing and manipulating Python code',
     long_description='Library for parsing and manipulating Python code',
     author='Kent Frazier',
